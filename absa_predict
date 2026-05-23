@@ -1,0 +1,387 @@
+"""
+absa_predict.py — Run inference with the trained MuRIL ABSA model
+
+What this file does:
+  - Loads the trained ABSA model from muril_absa_model/
+  - For each review, predicts which aspects are present
+  - For each detected aspect, predicts its sentiment
+  - Combines with rule-based fallback if ML confidence is low
+
+This is separate from predict.py — it only handles ABSA inference.
+server.py imports both predict.py and this file.
+
+Usage (single text):
+  python absa_predict.py --text "Delivery was fast but quality is poor"
+
+Usage (batch CSV):
+  python absa_predict.py --csv reviews.csv --output absa_results.csv
+
+Requirements:
+  pip install transformers torch pandas
+  (run absa_train.py first to generate muril_absa_model/)
+"""
+
+import argparse
+import json
+import os
+import sys
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+import pandas as pd
+
+
+# ── Reproduce model architecture from absa_train.py ───────────────────────────
+class MuRILABSAModel(nn.Module):
+    def __init__(self, model_name, num_aspects, num_classes_per_aspect, dropout=0.3):
+        super().__init__()
+        self.encoder     = AutoModel.from_pretrained(model_name)
+        hidden           = self.encoder.config.hidden_size
+        self.dropout     = nn.Dropout(dropout)
+        self.num_aspects = num_aspects
+        self.aspect_heads = nn.ModuleList([
+            nn.Linear(hidden, num_classes_per_aspect)
+            for _ in range(num_aspects)
+        ])
+
+    def forward(self, input_ids, attention_mask):
+        out    = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = self.dropout(out.last_hidden_state[:, 0, :])
+        return [head(pooled) for head in self.aspect_heads]
+
+
+# ── Rule-based fallback (used when ABSA model is unavailable) ─────────────────
+ASPECT_LEXICON = {
+    "product_quality": {
+        "en": ["quality","build","material","broken","damaged","defective","original",
+               "fake","genuine","works","stopped working","not working","dead","product",
+               "item","very poor","poor quality"],
+        "ta": ["தரம்","பொருள்","உடைந்த","நல்லா","மோசம்","வேலை செய்யவில்லை","கெட்டுவிட்டது"],
+        "hi": ["क्वालिटी","टूट","खराब","नकली","असली","काम नहीं","बेकार","kharab","toot"],
+    },
+    "delivery": {
+        "en": ["delivery","shipping","package","packaging","arrived","on time","late",
+               "delayed","fast","quick","slow","courier","packing","packed"],
+        "ta": ["டெலிவரி","பேக்கிங்","packing","வந்தது","சீக்கிரம்","parcel"],
+        "hi": ["डिलीवरी","पैकेजिंग","पैकिंग","आया","देर","जल्दी","courier","packing"],
+    },
+    "customer_support": {
+        "en": ["support","service","customer care","return","refund","replacement",
+               "response","helpful","useless","rude","complaint","resolved","seller"],
+        "ta": ["customer care","support","service","return","refund","உதவி","சேவை"],
+        "hi": ["customer care","support","सर्विस","रिटर्न","रिफंड","मदद","service","return"],
+    },
+    "value_for_money": {
+        "en": ["price","worth","value","expensive","cheap","affordable","overpriced",
+               "money","rupee","rupees","budget","paise vasool","worth it","not worth"],
+        "ta": ["விலை","பணம்","price","worth","value","rupee","paisa vasool"],
+        "hi": ["कीमत","दाम","पैसे","पैसा","रुपए","महंगा","सस्ता","worth","price","पैसा वसूल"],
+    },
+}
+
+POSITIVE_SIGNALS = [
+    "good","great","excellent","amazing","awesome","best","love","perfect","fast",
+    "quick","on time","helpful","worth","satisfied","happy","solid","works","neat",
+    "clean","original","genuine","totally worth","paise vasool","worth it","superb",
+    "smooth","நல்லா","safe","சீக்கிரம்","अच्छा","बढ़िया","पैसा वसूल","accha","badhiya",
+]
+NEGATIVE_SIGNALS = [
+    "bad","poor","terrible","awful","worst","hate","broken","damaged","defective",
+    "fake","slow","late","delayed","useless","rude","overpriced","waste",
+    "stopped working","not working","return","refund","dead","very poor",
+    "disappointed","not worth","மோசம்","உடைந்து","வேலை செய்யவில்லை","வேண்டாம்",
+    "खराब","बेकार","टूट","नकली","kharab","bekar","toot","work aagala",
+]
+
+
+def _detect_aspect_rule(text: str, aspect: str) -> bool:
+    text_lower = text.lower()
+    for kws in ASPECT_LEXICON[aspect].values():
+        if any(kw.lower() in text_lower for kw in kws):
+            return True
+    return False
+
+
+def _score_polarity_rule(text: str, aspect: str) -> tuple[str, float]:
+    text_lower = text.lower()
+    words      = text_lower.split()
+    positions  = []
+    for kws in ASPECT_LEXICON[aspect].values():
+        for kw in kws:
+            if kw.lower() in text_lower:
+                for i, w in enumerate(words):
+                    if kw.lower() in w or w in kw.lower():
+                        positions.append(i)
+    if positions:
+        ctx = []
+        for pos in positions:
+            ctx.extend(words[max(0, pos - 6):min(len(words), pos + 7)])
+        ctx_str = " ".join(ctx)
+    else:
+        ctx_str = text_lower
+
+    pos = sum(1 for s in POSITIVE_SIGNALS if s.lower() in ctx_str)
+    neg = sum(1 for s in NEGATIVE_SIGNALS if s.lower() in ctx_str)
+    total = pos + neg
+
+    if total == 0:
+        return "neutral", 50.0
+    if pos > neg:
+        return "positive", round(min((pos / total) * 100, 95.0), 1)
+    if neg > pos:
+        return "negative", round(min((neg / total) * 100, 95.0), 1)
+    return "neutral", 50.0
+
+
+# ── ABSA Predictor ─────────────────────────────────────────────────────────────
+class ABSAPredictor:
+    """
+    Loads the trained ABSA model and runs aspect-level sentiment inference.
+    Falls back to rule-based if model is not found.
+    """
+
+    # Confidence threshold below which we blend in rule-based signal
+    CONFIDENCE_THRESHOLD = 60.0
+
+    def __init__(self, model_dir="muril_absa_model", max_len=128):
+        self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.max_len     = max_len
+        self.ml_ready    = False
+
+        meta_path = os.path.join(model_dir, "absa_meta.json")
+        if not os.path.exists(meta_path):
+            print(
+                f"[ABSAPredictor] Warning: absa_meta.json not found in '{model_dir}'.\n"
+                "                Running in RULE-BASED fallback mode.\n"
+                "                Run absa_train.py to enable ML inference."
+            )
+            return
+
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        self.aspects           = meta["aspects"]
+        self.aspect_sent_labels = meta["aspect_sent_labels"]
+        self.not_mentioned     = meta["not_mentioned_label"]
+        base_model             = meta["base_model"]
+
+        print(f"[ABSAPredictor] Loading tokenizer from {model_dir}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
+        print(f"[ABSAPredictor] Loading ABSA model weights...")
+        self.model = MuRILABSAModel(
+            model_name=base_model,
+            num_aspects=len(self.aspects),
+            num_classes_per_aspect=len(self.aspect_sent_labels),
+        )
+        state = torch.load(
+            os.path.join(model_dir, "absa_model.pt"),
+            map_location=self.device,
+            weights_only=True,
+        )
+        self.model.load_state_dict(state)
+        self.model.to(self.device)
+        self.model.eval()
+        self.ml_ready = True
+        print("[ABSAPredictor] ABSA model ready.")
+
+    def predict(self, texts: list[str]) -> list[dict]:
+        """
+        Run ABSA on a list of texts.
+
+        Returns list of dicts:
+          {
+            text, aspects_detected,
+            aspect_sentiments: {
+              aspect: { label, confidence, source }
+            },
+            absa_summary
+          }
+        """
+        if self.ml_ready:
+            return self._predict_ml(texts)
+        else:
+            return self._predict_rule(texts)
+
+    def _predict_ml(self, texts: list[str]) -> list[dict]:
+        enc = self.tokenizer(
+            texts,
+            max_length=self.max_len,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids      = enc["input_ids"].to(self.device)
+        attention_mask = enc["attention_mask"].to(self.device)
+
+        with torch.no_grad():
+            logits_list = self.model(input_ids, attention_mask)
+
+        # Convert logits to probabilities per aspect
+        probs_list = [
+            F.softmax(logits, dim=1).cpu().numpy()
+            for logits in logits_list
+        ]
+
+        results = []
+        for i, text in enumerate(texts):
+            aspect_sentiments = {}
+            aspects_detected  = []
+
+            for asp_idx, aspect in enumerate(self.aspects):
+                probs      = probs_list[asp_idx][i]
+                pred_idx   = probs.argmax()
+                pred_label = self.aspect_sent_labels[pred_idx]
+                confidence = round(float(probs[pred_idx]) * 100, 1)
+
+                # Skip if model predicts "none" (aspect not mentioned)
+                if pred_label == self.not_mentioned:
+                    # Double-check with rule — model might be uncertain
+                    if not _detect_aspect_rule(text, aspect):
+                        continue
+
+                    # Rule says it's present — use rule-based polarity
+                    rule_label, rule_conf = _score_polarity_rule(text, aspect)
+                    aspect_sentiments[aspect] = {
+                        "label":      rule_label,
+                        "confidence": rule_conf,
+                        "source":     "rule_override",
+                    }
+                    aspects_detected.append(aspect)
+                    continue
+
+                aspects_detected.append(aspect)
+
+                # If ML confidence is low, blend with rule-based
+                if confidence < self.CONFIDENCE_THRESHOLD:
+                    rule_label, rule_conf = _score_polarity_rule(text, aspect)
+                    if rule_label != "neutral":
+                        # Use rule result but note it was a blend
+                        aspect_sentiments[aspect] = {
+                            "label":      rule_label,
+                            "confidence": round((confidence + rule_conf) / 2, 1),
+                            "source":     "ml+rule_blend",
+                        }
+                        continue
+
+                aspect_sentiments[aspect] = {
+                    "label":      pred_label,
+                    "confidence": confidence,
+                    "source":     "ml",
+                }
+
+            results.append({
+                "text":              text,
+                "aspects_detected":  aspects_detected,
+                "aspect_sentiments": aspect_sentiments,
+                "absa_summary":      _build_summary(aspect_sentiments),
+            })
+
+        return results
+
+    def _predict_rule(self, texts: list[str]) -> list[dict]:
+        """Pure rule-based fallback when ML model is unavailable."""
+        results = []
+        for text in texts:
+            aspect_sentiments = {}
+            aspects_detected  = []
+            for aspect in ASPECT_LEXICON.keys():
+                if _detect_aspect_rule(text, aspect):
+                    label, conf = _score_polarity_rule(text, aspect)
+                    aspects_detected.append(aspect)
+                    aspect_sentiments[aspect] = {
+                        "label":      label,
+                        "confidence": conf,
+                        "source":     "rule_based",
+                    }
+            results.append({
+                "text":              text,
+                "aspects_detected":  aspects_detected,
+                "aspect_sentiments": aspect_sentiments,
+                "absa_summary":      _build_summary(aspect_sentiments),
+            })
+        return results
+
+
+# ── Summary builder ────────────────────────────────────────────────────────────
+def _build_summary(aspect_sentiments: dict) -> str:
+    if not aspect_sentiments:
+        return "No specific aspects detected."
+    emoji = {"positive": "👍", "negative": "👎", "neutral": "➖"}
+    display = {
+        "product_quality":  "Product Quality",
+        "delivery":         "Delivery",
+        "customer_support": "Customer Support",
+        "value_for_money":  "Value for Money",
+    }
+    parts = []
+    for aspect, info in aspect_sentiments.items():
+        icon  = emoji.get(info["label"], "❓")
+        name  = display.get(aspect, aspect.replace("_", " ").title())
+        parts.append(f"{name}: {icon} {info['label']} ({info['confidence']}%)")
+    return " | ".join(parts)
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Aspect-Based Sentiment Analysis inference using trained MuRIL model"
+    )
+    parser.add_argument("--model",  default="muril_absa_model", help="ABSA model directory")
+    parser.add_argument("--text",   help="Single review to analyse")
+    parser.add_argument("--csv",    help="CSV file with a 'text' column")
+    parser.add_argument("--output", default="absa_results.csv", help="Output CSV path")
+    args = parser.parse_args()
+
+    predictor = ABSAPredictor(args.model)
+
+    if args.text:
+        results = predictor.predict([args.text])
+        r = results[0]
+        print(f"\n{'─'*65}")
+        print(f"Text    : {r['text']}")
+        print(f"{'─'*65}")
+        if r["aspect_sentiments"]:
+            print("Aspect Breakdown:")
+            for aspect, info in r["aspect_sentiments"].items():
+                name = aspect.replace("_", " ").title()
+                print(
+                    f"  {name:<22}: {info['label'].upper():<10}"
+                    f"({info['confidence']}%)  [{info['source']}]"
+                )
+        else:
+            print("  No specific aspects detected.")
+        print(f"{'─'*65}")
+        print(f"Summary : {r['absa_summary']}")
+        print(f"{'─'*65}\n")
+
+    elif args.csv:
+        df      = pd.read_csv(args.csv)
+        texts   = df["text"].tolist()
+        results = predictor.predict(texts)
+
+        rows = []
+        for r in results:
+            row = {
+                "text":             r["text"],
+                "aspects_detected": ", ".join(r["aspects_detected"]),
+                "absa_summary":     r["absa_summary"],
+            }
+            for asp, info in r["aspect_sentiments"].items():
+                row[f"{asp}_sentiment"]   = info["label"]
+                row[f"{asp}_confidence"]  = info["confidence"]
+                row[f"{asp}_source"]      = info["source"]
+            rows.append(row)
+
+        out_df = pd.DataFrame(rows)
+        out_df.to_csv(args.output, index=False)
+        print(f"Saved {len(rows)} ABSA predictions to {args.output}")
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
